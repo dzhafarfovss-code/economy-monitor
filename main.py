@@ -18,39 +18,30 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-class MacroAgent:
+class CBRAgent:
     def __init__(self):
         self.history_file = "history.json"
         self.processed_urls = self.load_history()
         
+        # Настраиваем надежное соединение
         self.session = requests.Session()
-        retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
-
-        # 1. СПИСОК ЦЕЛЕЙ (Отчеты)
-        self.targets_cbr = [
-            r"Обзор рисков",
-            r"Региональная экономика",
-            r"Макроэкономический опрос",
-            r"Денежно-кредитные условия",
-            r"Мониторинг отраслевых",
-            r"Доклад о денежно-кредитной"
-        ]
         
-        self.targets_minec = [
-            r"О текущей ситуации",
-            r"Картина деловой активности",
-            r"Экономический обзор"
-        ]
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
 
-        # 2. ФИЛЬТР ДАТЫ (Самое важное!)
-        # Ищем только конец года (Ноябрь, Декабрь 2025)
-        # Это захватит "вчера", "сегодня" и "неделю назад", но отсечет старье.
-        self.valid_dates = [
-            "декабря 2025", "ноября 2025",  # Текст на сайте (рус)
-            "12.2025", "11.2025",           # Даты в ссылках
-            "2025-12", "2025-11",           # Формат ISO
-            "_12_25", "_11_25"              # В названиях файлов
+        # СПИСОК ВАЖНЫХ ОТЧЕТОВ ЦБ
+        self.targets = [
+            r"Обзор рисков",               # Самое важное для валюты и нерезов
+            r"Региональная экономика",     # Важно для ставки (кадры/зарплаты)
+            r"Макроэкономический опрос",   # Ожидания рынка
+            r"Денежно-кредитные условия",  # Ставки банков
+            r"Мониторинг отраслевых",      # Потоки денег
+            r"Доклад о денежно-кредитной", # Базовый сценарий
+            r"Динамика потребительских цен", # Инфляция
+            r"Инфляционные ожидания"       # Опросы населения
         ]
 
     def load_history(self):
@@ -68,171 +59,146 @@ class MacroAgent:
             json.dump(list(self.processed_urls), f)
 
     def send_telegram(self, message):
-        if not TG_BOT_TOKEN or not TG_CHAT_ID: return
-        print(f"📤 TG Out: {message[:30]}...")
+        if not TG_BOT_TOKEN or not TG_CHAT_ID:
+            print("!!! Нет ключей Telegram")
+            return
+
+        print(f"📤 Отправка в TG: {message[:30]}...")
+        # Разбиваем длинные сообщения
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+            data = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
             try:
-                self.session.post(url, data={"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}, timeout=15)
+                self.session.post(url, data=data, timeout=10)
                 time.sleep(1)
             except Exception as e:
-                print(f"TG Error: {e}")
+                print(f"Ошибка TG: {e}")
 
-    def get_soup(self, url, source="generic"):
-        # Маскировка под Яндекс для всех
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        }
+    def get_soup(self, url):
         try:
-            resp = self.session.get(url, headers=headers, verify=False, timeout=60)
-            resp.encoding = resp.apparent_encoding
+            resp = self.session.get(url, headers=self.headers, verify=False, timeout=30)
+            resp.raise_for_status()
             return BeautifulSoup(resp.text, 'html.parser')
         except Exception as e:
-            print(f"⚠️ Сбой ({url}): {e}")
+            print(f"⚠️ Ошибка доступа к {url}: {e}")
             return None
 
     def extract_text_from_pdf(self, pdf_url):
-        print(f"⬇️ PDF: {pdf_url}")
+        print(f"⬇️ Качаем PDF: {pdf_url}")
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; YandexBot/3.0)"}
-            resp = self.session.get(pdf_url, headers=headers, verify=False, timeout=60)
+            resp = self.session.get(pdf_url, headers=self.headers, verify=False, timeout=60)
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
                 text = ""
-                # Читаем 7 страниц
-                for i in range(min(7, len(pdf.pages))):
+                # Читаем первые 6 страниц (самая суть всегда в начале)
+                for i in range(min(6, len(pdf.pages))):
                     t = pdf.pages[i].extract_text()
                     if t: text += t + "\n"
                 return text
         except Exception as e:
-            print(f"PDF Fail: {e}")
+            print(f"Ошибка PDF: {e}")
             return None
 
-    def analyze_with_gpt(self, text, title, source_name):
-        if not OPENAI_API_KEY: return "⚠️ Нет AI ключа."
-        print("🧠 GPT Анализ...")
+    def analyze_with_gpt(self, text, title):
+        if not OPENAI_API_KEY:
+            return "⚠️ Нет ключа OpenAI. Текст:\n" + text[:500]
+
+        print("🧠 GPT Анализирует...")
         try:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
+
             prompt = f"""
-            Ты — макроэкономист. Проанализируй: "{title}" ({source_name}).
-            Дай сигнал трейдеру ОФЗ.
-            СТРУКТУРА:
-            1. 🦅 **Риторика:** (Жесткая/Мягкая).
-            2. 📊 **Факты:** (Инфляция, Ожидания, Кредиты).
-            3. 🏛 **Вывод для ОФЗ:** (Покупать/Продавать).
-            4. 🔥 **Риск:** (Если есть).
-            Текст: {text[:12000]}
+            Ты — циничный макроэкономист и трейдер. Твоя специализация — ОФЗ и Рубль.
+            Проанализируй документ ЦБ РФ: "{title}".
+            
+            Дай четкий торговый сигнал. Не лей воду.
+            
+            СТРУКТУРА ОТВЕТА:
+            1. 🦅 **Риторика:** (Жесткая / Нейтральная / Мягкая). Почему? (1 предложение).
+            2. 📊 **Ключевые данные:** (Инфляция, Инфляционные ожидания, Рынок труда/Кадры, Кредитование).
+            3. 🏛 **Влияние на ОФЗ:** (Покупать / Продавать / Держать / Внимание на флоатеры).
+            4. 🔥 **Риск:** Самая главная проблема, описанная в отчете.
+
+            Текст документа (начало):
+            {text[:12000]}
             """
+
             response = client.chat.completions.create(
-                model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.3
+                model="gpt-4o", 
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"AI Error: {e}"
+            return f"Ошибка GPT: {e}"
 
-    def is_fresh(self, text_to_check):
-        """Проверка: содержит ли текст упоминание Ноября или Декабря 2025"""
-        if not text_to_check: return False
-        # Проверяем "2025"
-        if "2025" not in text_to_check: return False
+    def run(self):
+        print("🔍 Начинаем сканирование ЦБ РФ...")
         
-        # Проверяем наличие маркеров месяца (ноябрь/декабрь)
-        # Это отсечет январь-октябрь 2025
-        for date_marker in self.valid_dates:
-            if date_marker in text_to_check:
-                return True
-        return False
+        # Проверяем Календарь и основные разделы аналитики
+        urls_to_check = [
+            "https://www.cbr.ru/calendar",
+            "https://www.cbr.ru/analytics/dkp/",
+            "https://www.cbr.ru/analytics/fin_stab/"
+        ]
+        
+        found_count = 0
 
-    def check_cbr(self):
-        print("🔍 [ЦБ] Проверка...")
-        urls = ["https://www.cbr.ru/calendar"] # Календарь - самое надежное
-        
-        for start_url in urls:
+        for start_url in urls_to_check:
             soup = self.get_soup(start_url)
             if not soup: continue
 
-            for link in soup.find_all('a'):
+            links = soup.find_all('a')
+            for link in links:
                 title = link.get_text(strip=True)
                 href = link.get('href')
+                
                 if not href or not title: continue
                 
-                # === ГЛАВНЫЙ ФИЛЬТР ===
-                # Проверяем, есть ли в заголовке или ссылке нужная дата (Ноя/Дек 2025)
-                full_check_string = (title + href).lower()
-                
-                # Если в заголовке нет 2025 - сразу мимо
-                if "2025" not in title: continue
+                # === ФИЛЬТР: ТОЛЬКО 2025 ГОД ===
+                # Отсекаем все старые отчеты, чтобы не спамить
+                if "2025" not in title and "2025" not in href:
+                    continue
 
-                # Если нет маркеров конца года (чтобы не брать старье)
-                is_fresh_date = any(d in title.lower() for d in ["ноября", "декабря"])
-                # Если в заголовке нет месяца, но есть 2025 - можно рискнуть проверить
-                
-                is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets_cbr)
+                # Проверяем, подходит ли название под наш список интересов
+                is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets)
                 
                 if is_target:
                     full_url = urljoin("https://www.cbr.ru", href)
-                    if full_url in self.processed_urls: 
-                        print(f"Пропуск (уже было): {title}")
+                    
+                    # Если уже обрабатывали - пропускаем
+                    if full_url in self.processed_urls:
                         continue
                     
-                    print(f"🔥 НАЙДЕН КАНДИДАТ: {title}")
+                    print(f"🔥 НАЙДЕН НОВЫЙ ОТЧЕТ: {title}")
                     
-                    # Пытаемся найти PDF
-                    pdf_url = full_url if href.lower().endswith('.pdf') else None
-                    if not pdf_url:
-                        sub = self.get_soup(full_url)
-                        if sub:
-                            pl = sub.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
+                    # Ищем PDF
+                    pdf_url = None
+                    if href.lower().endswith('.pdf'):
+                        pdf_url = full_url
+                    else:
+                        # Заходим внутрь страницы
+                        sub_soup = self.get_soup(full_url)
+                        if sub_soup:
+                            # Ищем ссылку на скачивание
+                            pl = sub_soup.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
                             if pl: pdf_url = urljoin("https://www.cbr.ru", pl['href'])
                     
                     if pdf_url:
                         text = self.extract_text_from_pdf(pdf_url)
                         if text:
-                            # Доп. проверка: а вдруг PDF старый? (2022 год)
-                            # Смотрим первые 500 символов PDF на наличие 2025
-                            if "2025" in text[:500] or "2025" in title:
-                                ans = self.analyze_with_gpt(text, title, "ЦБ РФ")
-                                self.send_telegram(f"🏦 **ЦБ РФ**\n\n📄 {title}\n\n{ans}\n🔗 {pdf_url}")
-                                self.save_history(full_url)
-                            else:
-                                print("PDF оказался старым (не 2025).")
-
-    def check_minec(self):
-        print("🔍 [МИНЭК] Проверка...")
-        url = "https://www.economy.gov.ru/material/directions/makroec/ekonomicheskie_obzory/"
-        soup = self.get_soup(url) 
-        if not soup: return
-
-        for link in soup.find_all('a'):
-            title = link.get_text(strip=True)
-            href = link.get('href')
-            if not href or not title: continue
-            
-            # Фильтр на Ноябрь/Декабрь 2025
-            if "2025" not in title: continue
-            
-            is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets_minec)
-            if is_target:
-                full_url = urljoin("https://www.economy.gov.ru", href)
-                if full_url in self.processed_urls: continue
-                
-                print(f"🔥 НАЙДЕН МИНЭК: {title}")
-                sub = self.get_soup(full_url)
-                if sub:
-                    pl = sub.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
-                    if pl:
-                        p_url = urljoin("https://www.economy.gov.ru", pl['href'])
-                        text = self.extract_text_from_pdf(p_url)
-                        if text:
-                            ans = self.analyze_with_gpt(text, title, "МинЭк")
-                            self.send_telegram(f"📉 **МИНЭК**\n\n📄 {title}\n\n{ans}\n🔗 {p_url}")
+                            analysis = self.analyze_with_gpt(text, title)
+                            
+                            # Формируем сообщение
+                            msg = f"🏦 **ЦБ РФ: ВЫШЕЛ ОТЧЕТ**\n\n📄 *{title}*\n\n{analysis}\n\n🔗 [Читать оригинал]({pdf_url})"
+                            
+                            self.send_telegram(msg)
                             self.save_history(full_url)
+                            found_count += 1
+                    else:
+                        print(f"PDF не найден для {title}")
 
-    def run(self):
-        self.check_cbr()
-        self.check_minec()
-        print("✅ Готово")
+        print(f"✅ Готово. Найдено новых отчетов: {found_count}")
 
 if __name__ == "__main__":
-    MacroAgent().run()
+    CBRAgent().run()
