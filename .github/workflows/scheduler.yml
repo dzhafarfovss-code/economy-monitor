@@ -2,12 +2,18 @@ name: Economy Monitor Cron
 
 on:
   schedule:
-    # Запуск раз в час (в начале часа)
-    - cron: '0 * * * *'
-  workflow_dispatch: # Кнопка для ручного запуска
-
-permissions:
-  contents: write
+    # --- РАСШИФРОВКА ВРЕМЕНИ ---
+    # Москва = UTC + 3
+    # Нам нужно: 16:00 - 20:50 МСК
+    # В UTC это: 13:00 - 17:50
+    #
+    # */10  = каждые 10 минут
+    # 13-17 = в часы: 13, 14, 15, 16, 17 (по UTC)
+    # 1-5   = Понедельник - Пятница
+    
+    - cron: '*/10 13-17 * * 1-5'
+    
+  workflow_dispatch: # Кнопка для ручного запуска, если захочешь проверить утром
 
 jobs:
   check-website:
@@ -30,6 +36,7 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python main.py
 
       - name: Commit and Push history
