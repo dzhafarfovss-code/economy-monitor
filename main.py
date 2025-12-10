@@ -9,13 +9,11 @@ from urllib.parse import urljoin
 import json
 import time
 
-# --- НАСТРОЙКИ (Берем из GitHub Secrets) ---
-# Если ключей нет, скрипт не упадет, а просто напишет ошибку в лог
+# --- НАСТРОЙКИ ---
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# Отключаем предупреждения SSL (сайты госорганов часто имеют кривые сертификаты)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class MacroAgent:
@@ -23,13 +21,11 @@ class MacroAgent:
         self.history_file = "history.json"
         self.processed_urls = self.load_history()
         
-        # Притворяемся обычным браузером
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
 
-        # ЧТО ИЩЕМ У ЦБ (Ключевые слова)
         self.targets_cbr = [
             r"Обзор рисков финансовых рынков",
             r"Региональная экономика",
@@ -39,7 +35,6 @@ class MacroAgent:
             r"Доклад о денежно-кредитной политике"
         ]
         
-        # ЧТО ИЩЕМ У МИНЭКА
         self.targets_minec = [
             r"О текущей ситуации",
             r"Картина деловой активности",
@@ -47,7 +42,6 @@ class MacroAgent:
         ]
 
     def load_history(self):
-        """Загружает список уже обработанных ссылок"""
         if os.path.exists(self.history_file):
             try:
                 with open(self.history_file, 'r') as f:
@@ -57,85 +51,70 @@ class MacroAgent:
         return set()
 
     def save_history(self, url):
-        """Запоминает ссылку, чтобы не слать повторы"""
         self.processed_urls.add(url)
         with open(self.history_file, 'w') as f:
             json.dump(list(self.processed_urls), f)
 
     def send_telegram(self, message):
-        """Отправка в Telegram"""
         if not TG_BOT_TOKEN or not TG_CHAT_ID:
-            print("!!! TG Ключи не найдены в Secrets")
+            print("!!! TG Keys missing")
             return
 
-        # Телеграм не принимает сообщения длиннее 4096 символов, режем на куски
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-            data = {
-                "chat_id": TG_CHAT_ID, 
-                "text": chunk, 
-                "parse_mode": "Markdown"
-            }
+            data = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
             try:
                 requests.post(url, data=data, timeout=10)
-                time.sleep(1) # Пауза между сообщениями
+                time.sleep(1)
             except Exception as e:
-                print(f"Ошибка отправки TG: {e}")
+                print(f"TG Error: {e}")
 
-    def get_soup(self, url):
-        """Скачивает страницу"""
+    def get_soup(self, url, timeout=20):
         try:
-            resp = requests.get(url, headers=self.headers, verify=False, timeout=20)
+            resp = requests.get(url, headers=self.headers, verify=False, timeout=timeout)
             resp.raise_for_status()
-            # Фикс кодировки
             resp.encoding = resp.apparent_encoding
             return BeautifulSoup(resp.text, 'html.parser')
         except Exception as e:
-            print(f"Ошибка доступа к {url}: {e}")
+            print(f"Connection Error ({url}): {e}")
             return None
 
     def extract_text_from_pdf(self, pdf_url):
-        """Качает PDF и читает текст (первые 7 страниц)"""
-        print(f"⬇️ Скачиваем PDF: {pdf_url}")
+        print(f"⬇️ PDF: {pdf_url}")
         try:
-            resp = requests.get(pdf_url, headers=self.headers, verify=False, timeout=30)
+            resp = requests.get(pdf_url, headers=self.headers, verify=False, timeout=45)
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
                 text = ""
-                # Читаем только первые 7 страниц (там вся суть для трейдинга)
-                max_pages = min(7, len(pdf.pages))
-                for i in range(max_pages):
-                    page_text = pdf.pages[i].extract_text()
-                    if page_text:
-                        text += page_text + "\n"
+                # Берем первые 5 страниц (достаточно для анализа)
+                for i in range(min(5, len(pdf.pages))):
+                    t = pdf.pages[i].extract_text()
+                    if t: text += t + "\n"
                 return text
         except Exception as e:
-            print(f"Ошибка чтения PDF: {e}")
+            print(f"PDF Error: {e}")
             return None
 
     def analyze_with_gpt(self, text, title, source_name):
-        """Анализ через GPT-4o"""
         if not OPENAI_API_KEY:
-            return "⚠️ Ключ OpenAI не найден. Вот начало текста:\n" + text[:600] + "..."
+            return "⚠️ AI Key missing. Text start:\n" + text[:500]
 
-        print("🧠 Думаем (запрос к AI)...")
+        print("🧠 AI Analysis...")
         try:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
 
             prompt = f"""
-            Ты — опытный макроэкономист и трейдер облигациями (ОФЗ).
-            Проанализируй документ: "{title}" от {source_name}.
+            Ты — макроэкономист. Проанализируй: "{title}" ({source_name}).
+            Дай краткую выжимку для инвестора в ОФЗ и Рубль.
             
-            Дай СУХУЮ выжимку для принятия инвестиционных решений.
-            
-            СТРУКТУРА ОТВЕТА:
-            1. 🦅 **Риторика:** (Жесткая/Мягкая/Нейтральная). Почему?
-            2. 📊 **Главные цифры:** (Инфляция, ожидания, кадровый голод, потоки в ОФЗ).
-            3. 🏛 **Влияние на ОФЗ:** (Покупать/Продавать/Держать). Есть ли смена тренда?
-            4. 🔥 **Риски:** Что может пойти не так?
+            СТРУКТУРА:
+            1. 🦅 **Риторика:** (Жесткая/Мягкая).
+            2. 📊 **Главные цифры:** (Инфляция, ожидания, кредитование).
+            3. 🏛 **Вывод для ОФЗ:** (Покупать/Продавать).
+            4. 🔥 **Риски:** (Если есть).
 
-            Текст документа (первые страницы):
-            {text[:12000]}
+            Текст:
+            {text[:10000]}
             """
 
             response = client.chat.completions.create(
@@ -145,115 +124,94 @@ class MacroAgent:
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"Ошибка GPT: {e}. Сырой текст: {text[:500]}..."
+            return f"AI Error: {e}"
 
-    # --- ПРОВЕРКА ЦБ РФ (Календарь событий) ---
     def check_cbr(self):
-        print("🔍 [ЦБ РФ] Проверка календаря...")
-        base_url = "https://www.cbr.ru"
-        calendar_url = "https://www.cbr.ru/calendar"
+        print("🔍 [ЦБ] Сканирование...")
+        # Смотрим не только календарь, но и раздел аналитики, там надежнее
+        urls_to_check = [
+            "https://www.cbr.ru/calendar",
+            "https://www.cbr.ru/analytics/dkp/hosting/", # Обзоры ДКП
+            "https://www.cbr.ru/analytics/fin_stab/"     # Обзоры рисков
+        ]
         
-        soup = self.get_soup(calendar_url)
-        if not soup: return
+        for base_section in urls_to_check:
+            soup = self.get_soup(base_section)
+            if not soup: continue
 
-        # Ищем все ссылки на странице
-        links = soup.find_all('a')
-        
-        for link in links:
-            title = link.get_text(strip=True)
-            href = link.get('href')
-            
-            if not href or not title: continue
-            
-            # Проверяем название по нашему списку
-            is_target = any(re.search(pattern, title, re.IGNORECASE) for pattern in self.targets_cbr)
-            
-            if is_target:
-                full_url = urljoin(base_url, href)
+            links = soup.find_all('a')
+            for link in links:
+                title = link.get_text(strip=True)
+                href = link.get('href')
                 
-                # Если уже видели - пропускаем
-                if full_url in self.processed_urls: continue
+                if not href or not title: continue
                 
-                print(f"🔥 НАЙДЕН ОТЧЕТ ЦБ: {title}")
-                
-                # Ищем PDF внутри страницы
-                pdf_url = None
-                
-                # Иногда ссылка ведет сразу на файл
-                if href.lower().endswith('.pdf'):
-                    pdf_url = full_url
-                else:
-                    # Заходим внутрь новости
-                    sub_soup = self.get_soup(full_url)
-                    if sub_soup:
-                        # Ищем ссылку на PDF
-                        pdf_link = sub_soup.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
-                        # Иногда кнопка называется "Скачать"
-                        if not pdf_link:
-                            pdf_link = sub_soup.find('a', string=re.compile(r'Скачать|Полный текст', re.IGNORECASE))
-                            
-                        if pdf_link:
-                            pdf_url = urljoin(base_url, pdf_link['href'])
+                # === ФИЛЬТР 2025 ГОДА ===
+                # Если в названии или ссылке нет "2025" - пропускаем
+                if "2025" not in title and "2025" not in href:
+                    continue
 
-                if pdf_url:
-                    text = self.extract_text_from_pdf(pdf_url)
-                    if text:
-                        analysis = self.analyze_with_gpt(text, title, "Банка России")
-                        msg = f"🏦 **ЦБ РФ: НОВЫЙ ОТЧЕТ**\n\n📄 *{title}*\n\n{analysis}\n\n🔗 [Читать оригинал]({pdf_url})"
-                        self.send_telegram(msg)
-                        self.save_history(full_url)
+                is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets_cbr)
+                
+                if is_target:
+                    full_url = urljoin("https://www.cbr.ru", href)
+                    if full_url in self.processed_urls: continue
+                    
+                    print(f"🔥 НАЙДЕН СВЕЖИЙ ОТЧЕТ: {title}")
+                    
+                    pdf_url = None
+                    if href.lower().endswith('.pdf'):
+                        pdf_url = full_url
                     else:
-                        print("Не удалось прочитать текст PDF")
-                else:
-                    print(f"PDF не найден на странице {full_url}")
+                        sub = self.get_soup(full_url)
+                        if sub:
+                            pl = sub.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
+                            if pl: pdf_url = urljoin("https://www.cbr.ru", pl['href'])
+                    
+                    if pdf_url:
+                        text = self.extract_text_from_pdf(pdf_url)
+                        if text:
+                            ans = self.analyze_with_gpt(text, title, "ЦБ РФ")
+                            self.send_telegram(f"🏦 **ЦБ РФ (2025)**\n\n📄 {title}\n\n{ans}\n🔗 {pdf_url}")
+                            self.save_history(full_url)
 
-    # --- ПРОВЕРКА МИНЭК (Росстат данные) ---
     def check_minec(self):
-        print("🔍 [МИНЭК] Проверка обзоров...")
-        base_url = "https://www.economy.gov.ru"
-        # Раздел обзоров
-        section_url = "https://www.economy.gov.ru/material/directions/makroec/ekonomicheskie_obzory/"
-        
-        soup = self.get_soup(section_url)
+        print("🔍 [МИНЭК] Сканирование...")
+        url = "https://www.economy.gov.ru/material/directions/makroec/ekonomicheskie_obzory/"
+        # Увеличенный таймаут для Минэка
+        soup = self.get_soup(url, timeout=45) 
         if not soup: return
 
         links = soup.find_all('a')
-        
         for link in links:
             title = link.get_text(strip=True)
             href = link.get('href')
-            
             if not href or not title: continue
             
-            is_target = any(re.search(pattern, title, re.IGNORECASE) for pattern in self.targets_minec)
-            
+            # Тоже фильтруем 2025
+            if "2025" not in title and "2025" not in href: continue
+
+            is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets_minec)
             if is_target:
-                full_url = urljoin(base_url, href)
+                full_url = urljoin("https://www.economy.gov.ru", href)
                 if full_url in self.processed_urls: continue
                 
-                print(f"🔥 НАЙДЕН ОБЗОР МИНЭКА: {title}")
-                
-                # Заходим внутрь
-                sub_soup = self.get_soup(full_url)
-                if sub_soup:
-                    # Ищем PDF
-                    pdf_link = sub_soup.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
-                    if pdf_link:
-                        pdf_url = urljoin(base_url, pdf_link['href'])
-                        text = self.extract_text_from_pdf(pdf_url)
-                        
+                print(f"🔥 НАЙДЕН МИНЭК: {title}")
+                sub = self.get_soup(full_url, timeout=45)
+                if sub:
+                    pl = sub.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
+                    if pl:
+                        p_url = urljoin("https://www.economy.gov.ru", pl['href'])
+                        text = self.extract_text_from_pdf(p_url)
                         if text:
-                            analysis = self.analyze_with_gpt(text, title, "Минэкономразвития")
-                            msg = f"📉 **МИНЭК (ДАННЫЕ РОССТАТА)**\n\n📄 *{title}*\n\n{analysis}\n\n🔗 [Читать оригинал]({pdf_url})"
-                            self.send_telegram(msg)
+                            ans = self.analyze_with_gpt(text, title, "МинЭк")
+                            self.send_telegram(f"📉 **МИНЭК**\n\n📄 {title}\n\n{ans}\n🔗 {p_url}")
                             self.save_history(full_url)
 
     def run(self):
-        # Запускаем проверки последовательно
         self.check_cbr()
         self.check_minec()
-        print("✅ Проверка завершена. Скрипт засыпает.")
+        print("✅ Готово")
 
 if __name__ == "__main__":
-    agent = MacroAgent()
-    agent.run()
+    MacroAgent().run()
