@@ -23,25 +23,26 @@ class CBRAgent:
         self.history_file = "history.json"
         self.processed_urls = self.load_history()
         
-        # Настраиваем надежное соединение
         self.session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
         
+        # Притворяемся Яндексом (на всякий случай)
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
 
-        # СПИСОК ВАЖНЫХ ОТЧЕТОВ ЦБ
+        # СПИСОК ВАЖНЫХ ОТЧЕТОВ
         self.targets = [
-            r"Обзор рисков",               # Самое важное для валюты и нерезов
-            r"Региональная экономика",     # Важно для ставки (кадры/зарплаты)
-            r"Макроэкономический опрос",   # Ожидания рынка
-            r"Денежно-кредитные условия",  # Ставки банков
-            r"Мониторинг отраслевых",      # Потоки денег
-            r"Доклад о денежно-кредитной", # Базовый сценарий
-            r"Динамика потребительских цен", # Инфляция
-            r"Инфляционные ожидания"       # Опросы населения
+            r"Обзор рисков",
+            r"Региональная экономика",
+            r"Макроэкономический опрос",
+            r"Денежно-кредитные условия",
+            r"Мониторинг отраслевых",
+            r"Доклад о денежно-кредитной",
+            r"Инфляционные ожидания",
+            r"Динамика потребительских цен"
         ]
 
     def load_history(self):
@@ -59,12 +60,8 @@ class CBRAgent:
             json.dump(list(self.processed_urls), f)
 
     def send_telegram(self, message):
-        if not TG_BOT_TOKEN or not TG_CHAT_ID:
-            print("!!! Нет ключей Telegram")
-            return
-
-        print(f"📤 Отправка в TG: {message[:30]}...")
-        # Разбиваем длинные сообщения
+        if not TG_BOT_TOKEN or not TG_CHAT_ID: return
+        print(f"📤 TG: {message[:30]}...")
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
             data = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
@@ -72,7 +69,7 @@ class CBRAgent:
                 self.session.post(url, data=data, timeout=10)
                 time.sleep(1)
             except Exception as e:
-                print(f"Ошибка TG: {e}")
+                print(f"TG Error: {e}")
 
     def get_soup(self, url):
         try:
@@ -80,7 +77,7 @@ class CBRAgent:
             resp.raise_for_status()
             return BeautifulSoup(resp.text, 'html.parser')
         except Exception as e:
-            print(f"⚠️ Ошибка доступа к {url}: {e}")
+            print(f"⚠️ Ошибка доступа ({url}): {e}")
             return None
 
     def extract_text_from_pdf(self, pdf_url):
@@ -89,8 +86,8 @@ class CBRAgent:
             resp = self.session.get(pdf_url, headers=self.headers, verify=False, timeout=60)
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
                 text = ""
-                # Читаем первые 6 страниц (самая суть всегда в начале)
-                for i in range(min(6, len(pdf.pages))):
+                # Первые 7 страниц
+                for i in range(min(7, len(pdf.pages))):
                     t = pdf.pages[i].extract_text()
                     if t: text += t + "\n"
                 return text
@@ -99,55 +96,41 @@ class CBRAgent:
             return None
 
     def analyze_with_gpt(self, text, title):
-        if not OPENAI_API_KEY:
-            return "⚠️ Нет ключа OpenAI. Текст:\n" + text[:500]
-
-        print("🧠 GPT Анализирует...")
+        if not OPENAI_API_KEY: return "⚠️ Нет ключа OpenAI."
+        print("🧠 GPT Анализ...")
         try:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
-
             prompt = f"""
-            Ты — циничный макроэкономист и трейдер. Твоя специализация — ОФЗ и Рубль.
+            Ты — макроэкономист-трейдер. 
             Проанализируй документ ЦБ РФ: "{title}".
+            Дай сигнал для ОФЗ.
             
-            Дай четкий торговый сигнал. Не лей воду.
-            
-            СТРУКТУРА ОТВЕТА:
-            1. 🦅 **Риторика:** (Жесткая / Нейтральная / Мягкая). Почему? (1 предложение).
-            2. 📊 **Ключевые данные:** (Инфляция, Инфляционные ожидания, Рынок труда/Кадры, Кредитование).
-            3. 🏛 **Влияние на ОФЗ:** (Покупать / Продавать / Держать / Внимание на флоатеры).
-            4. 🔥 **Риск:** Самая главная проблема, описанная в отчете.
+            СТРУКТУРА:
+            1. 🦅 **Риторика:** (Жесткая/Мягкая/Нейтральная).
+            2. 📊 **Факты:** (Инфляция, Ожидания, Кредиты).
+            3. 🏛 **Вывод для ОФЗ:** (Покупать/Продавать/Держать).
+            4. 🔥 **Риск:** (Главная угроза).
 
-            Текст документа (начало):
-            {text[:12000]}
+            Текст: {text[:12000]}
             """
-
             response = client.chat.completions.create(
-                model="gpt-4o", 
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
+                model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.3
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"Ошибка GPT: {e}"
+            return f"GPT Error: {e}"
 
     def run(self):
-        print("🔍 Начинаем сканирование ЦБ РФ...")
+        print("🔍 Сканируем Календарь ЦБ...")
         
-        # Проверяем Календарь и основные разделы аналитики
-        urls_to_check = [
-            "https://www.cbr.ru/calendar",
-            "https://www.cbr.ru/analytics/dkp/",
-            "https://www.cbr.ru/analytics/fin_stab/"
-        ]
+        # ТОЛЬКО ОДНА ССЫЛКА - КАЛЕНДАРЬ
+        url = "https://www.cbr.ru/calendar"
         
-        found_count = 0
+        soup = self.get_soup(url)
+        found_new = False
 
-        for start_url in urls_to_check:
-            soup = self.get_soup(start_url)
-            if not soup: continue
-
+        if soup:
             links = soup.find_all('a')
             for link in links:
                 title = link.get_text(strip=True)
@@ -155,50 +138,44 @@ class CBRAgent:
                 
                 if not href or not title: continue
                 
-                # === ФИЛЬТР: ТОЛЬКО 2025 ГОД ===
-                # Отсекаем все старые отчеты, чтобы не спамить
+                # 1. ФИЛЬТР 2025 (Чтобы не брать старье)
                 if "2025" not in title and "2025" not in href:
                     continue
 
-                # Проверяем, подходит ли название под наш список интересов
+                # 2. ФИЛЬТР ПО НАЗВАНИЮ
                 is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets)
                 
                 if is_target:
                     full_url = urljoin("https://www.cbr.ru", href)
                     
-                    # Если уже обрабатывали - пропускаем
+                    # Проверка истории
                     if full_url in self.processed_urls:
                         continue
                     
-                    print(f"🔥 НАЙДЕН НОВЫЙ ОТЧЕТ: {title}")
+                    print(f"🔥 НАЙДЕН НОВЫЙ: {title}")
+                    found_new = True
                     
                     # Ищем PDF
-                    pdf_url = None
-                    if href.lower().endswith('.pdf'):
-                        pdf_url = full_url
-                    else:
-                        # Заходим внутрь страницы
-                        sub_soup = self.get_soup(full_url)
-                        if sub_soup:
-                            # Ищем ссылку на скачивание
-                            pl = sub_soup.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
+                    pdf_url = full_url if href.lower().endswith('.pdf') else None
+                    if not pdf_url:
+                        sub = self.get_soup(full_url)
+                        if sub:
+                            pl = sub.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
                             if pl: pdf_url = urljoin("https://www.cbr.ru", pl['href'])
                     
                     if pdf_url:
                         text = self.extract_text_from_pdf(pdf_url)
                         if text:
-                            analysis = self.analyze_with_gpt(text, title)
-                            
-                            # Формируем сообщение
-                            msg = f"🏦 **ЦБ РФ: ВЫШЕЛ ОТЧЕТ**\n\n📄 *{title}*\n\n{analysis}\n\n🔗 [Читать оригинал]({pdf_url})"
-                            
-                            self.send_telegram(msg)
+                            ans = self.analyze_with_gpt(text, title)
+                            self.send_telegram(f"🏦 **ЦБ РФ**\n\n📄 {title}\n\n{ans}\n🔗 {pdf_url}")
                             self.save_history(full_url)
-                            found_count += 1
                     else:
-                        print(f"PDF не найден для {title}")
+                        print("PDF не найден.")
 
-        print(f"✅ Готово. Найдено новых отчетов: {found_count}")
+        if not found_new:
+            print("✅ Новых документов в календаре пока нет.")
+        else:
+            print("✅ Уведомления отправлены.")
 
 if __name__ == "__main__":
     CBRAgent().run()
