@@ -21,11 +21,15 @@ class MacroAgent:
         self.history_file = "history.json"
         self.processed_urls = self.load_history()
         
+        # Маскируемся под обычного пользователя, пришедшего с Яндекса
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://yandex.ru/"
         }
 
+        # ЧТО ИЩЕМ (Имена файлов/статей)
         self.targets_cbr = [
             r"Обзор рисков финансовых рынков",
             r"Региональная экономика",
@@ -69,24 +73,24 @@ class MacroAgent:
             except Exception as e:
                 print(f"TG Error: {e}")
 
-    def get_soup(self, url, timeout=20):
+    def get_soup(self, url, timeout=30):
         try:
             resp = requests.get(url, headers=self.headers, verify=False, timeout=timeout)
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding
             return BeautifulSoup(resp.text, 'html.parser')
         except Exception as e:
-            print(f"Connection Error ({url}): {e}")
+            print(f"⚠️ Ошибка доступа ({url}): {e}")
             return None
 
     def extract_text_from_pdf(self, pdf_url):
         print(f"⬇️ PDF: {pdf_url}")
         try:
-            resp = requests.get(pdf_url, headers=self.headers, verify=False, timeout=45)
+            resp = requests.get(pdf_url, headers=self.headers, verify=False, timeout=60)
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
                 text = ""
-                # Берем первые 5 страниц (достаточно для анализа)
-                for i in range(min(5, len(pdf.pages))):
+                # Читаем первые 6 страниц
+                for i in range(min(6, len(pdf.pages))):
                     t = pdf.pages[i].extract_text()
                     if t: text += t + "\n"
                 return text
@@ -98,23 +102,22 @@ class MacroAgent:
         if not OPENAI_API_KEY:
             return "⚠️ AI Key missing. Text start:\n" + text[:500]
 
-        print("🧠 AI Analysis...")
+        print("🧠 GPT думает...")
         try:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
 
             prompt = f"""
-            Ты — макроэкономист. Проанализируй: "{title}" ({source_name}).
-            Дай краткую выжимку для инвестора в ОФЗ и Рубль.
+            Ты — макроэкономический аналитик для рынка ОФЗ.
+            Проанализируй документ: "{title}" ({source_name}).
             
-            СТРУКТУРА:
-            1. 🦅 **Риторика:** (Жесткая/Мягкая).
-            2. 📊 **Главные цифры:** (Инфляция, ожидания, кредитование).
-            3. 🏛 **Вывод для ОФЗ:** (Покупать/Продавать).
-            4. 🔥 **Риски:** (Если есть).
-
-            Текст:
-            {text[:10000]}
+            Выдели ТОЛЬКО суть для трейдера:
+            1. 🦅 **Риторика:** (Жесткая/Мягкая/Нейтральная) + Аргумент.
+            2. 📊 **Факты:** (Инфляция, ожидания, дефицит кадров, бюджет).
+            3. 🏛 **ОФЗ:** (Покупать/Продавать/Держать).
+            
+            Текст (начало документа):
+            {text[:11000]}
             """
 
             response = client.chat.completions.create(
@@ -127,16 +130,15 @@ class MacroAgent:
             return f"AI Error: {e}"
 
     def check_cbr(self):
-        print("🔍 [ЦБ] Сканирование...")
-        # Смотрим не только календарь, но и раздел аналитики, там надежнее
-        urls_to_check = [
-            "https://www.cbr.ru/calendar",
-            "https://www.cbr.ru/analytics/dkp/hosting/", # Обзоры ДКП
-            "https://www.cbr.ru/analytics/fin_stab/"     # Обзоры рисков
+        print("🔍 [ЦБ] Проверка...")
+        # Убрали битые ссылки, оставили надежные
+        urls = [
+            "https://www.cbr.ru/calendar", 
+            "https://www.cbr.ru/analytics/"
         ]
         
-        for base_section in urls_to_check:
-            soup = self.get_soup(base_section)
+        for base_url in urls:
+            soup = self.get_soup(base_url)
             if not soup: continue
 
             links = soup.find_all('a')
@@ -146,25 +148,28 @@ class MacroAgent:
                 
                 if not href or not title: continue
                 
-                # === ФИЛЬТР 2025 ГОДА ===
-                # Если в названии или ссылке нет "2025" - пропускаем
-                if "2025" not in title and "2025" not in href:
-                    continue
+                # ФИЛЬТР: Только 2025 год (чтобы не качать старье)
+                if "2025" not in title and "2025" not in href: continue
 
+                # Проверка названия
                 is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets_cbr)
                 
                 if is_target:
                     full_url = urljoin("https://www.cbr.ru", href)
+                    
                     if full_url in self.processed_urls: continue
                     
-                    print(f"🔥 НАЙДЕН СВЕЖИЙ ОТЧЕТ: {title}")
+                    print(f"🔥 НАЙДЕН: {title}")
                     
+                    # Логика поиска PDF
                     pdf_url = None
                     if href.lower().endswith('.pdf'):
                         pdf_url = full_url
                     else:
+                        # Заходим внутрь статьи
                         sub = self.get_soup(full_url)
                         if sub:
+                            # Ищем ссылку на PDF внутри
                             pl = sub.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
                             if pl: pdf_url = urljoin("https://www.cbr.ru", pl['href'])
                     
@@ -172,14 +177,16 @@ class MacroAgent:
                         text = self.extract_text_from_pdf(pdf_url)
                         if text:
                             ans = self.analyze_with_gpt(text, title, "ЦБ РФ")
-                            self.send_telegram(f"🏦 **ЦБ РФ (2025)**\n\n📄 {title}\n\n{ans}\n🔗 {pdf_url}")
+                            self.send_telegram(f"🏦 **ЦБ РФ**\n\n📄 {title}\n\n{ans}\n🔗 {pdf_url}")
                             self.save_history(full_url)
+                            # Даем паузу, чтобы ЦБ не забанил
+                            time.sleep(5)
 
     def check_minec(self):
-        print("🔍 [МИНЭК] Сканирование...")
+        print("🔍 [МИНЭК] Проверка...")
         url = "https://www.economy.gov.ru/material/directions/makroec/ekonomicheskie_obzory/"
-        # Увеличенный таймаут для Минэка
-        soup = self.get_soup(url, timeout=45) 
+        # Увеличенный таймаут
+        soup = self.get_soup(url, timeout=40) 
         if not soup: return
 
         links = soup.find_all('a')
@@ -188,7 +195,6 @@ class MacroAgent:
             href = link.get('href')
             if not href or not title: continue
             
-            # Тоже фильтруем 2025
             if "2025" not in title and "2025" not in href: continue
 
             is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets_minec)
@@ -197,7 +203,7 @@ class MacroAgent:
                 if full_url in self.processed_urls: continue
                 
                 print(f"🔥 НАЙДЕН МИНЭК: {title}")
-                sub = self.get_soup(full_url, timeout=45)
+                sub = self.get_soup(full_url, timeout=40)
                 if sub:
                     pl = sub.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
                     if pl:
