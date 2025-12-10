@@ -20,6 +20,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class CBRAgent:
     def __init__(self):
+        self.history_file = "history.json"
+        self.processed_urls = self.load_history()
+        
         self.session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -39,26 +42,35 @@ class CBRAgent:
             "Инфляционные ожидания"
         ]
 
+    def load_history(self):
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r') as f:
+                    return set(json.load(f))
+            except:
+                return set()
+        return set()
+
+    def save_history(self, url):
+        self.processed_urls.add(url)
+        with open(self.history_file, 'w') as f:
+            json.dump(list(self.processed_urls), f)
+
     def send_telegram(self, message):
         if not TG_BOT_TOKEN or not TG_CHAT_ID: return
         
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         
-        # Разбиваем длинное сообщение
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
-            # ПОПЫТКА 1: Красиво (Markdown)
+            # 1. Пробуем Markdown
             data = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
             resp = self.session.post(url, data=data)
             
-            # Если ошибка форматирования (400 Bad Request)
+            # 2. Если ошибка (400), шлем чистый текст
             if resp.status_code != 200:
-                print(f"⚠️ Ошибка Markdown: {resp.text}. Пробую обычным текстом...")
-                # ПОПЫТКА 2: Обычный текст (Без форматирования)
+                print("⚠️ Ошибка формата. Шлем обычным текстом.")
                 clean_text = chunk.replace("*", "").replace("_", "").replace("`", "")
-                data = {"chat_id": TG_CHAT_ID, "text": clean_text} # Без parse_mode
-                self.session.post(url, data=data)
-            else:
-                print("✅ Сообщение доставлено.")
+                self.session.post(url, data={"chat_id": TG_CHAT_ID, "text": clean_text})
             
             time.sleep(1)
 
@@ -66,12 +78,11 @@ class CBRAgent:
         try:
             resp = self.session.get(url, headers=self.headers, verify=False, timeout=30)
             return BeautifulSoup(resp.text, 'html.parser')
-        except Exception as e:
-            print(f"Ошибка доступа {url}: {e}")
+        except:
             return None
 
     def extract_text_from_pdf(self, pdf_url):
-        print(f"⬇️ Качаем PDF: {pdf_url}")
+        print(f"⬇️ Качаем: {pdf_url}")
         try:
             resp = self.session.get(pdf_url, headers=self.headers, verify=False, timeout=60)
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
@@ -84,15 +95,15 @@ class CBRAgent:
             return None
 
     def analyze_with_gpt(self, text, title):
-        if not OPENAI_API_KEY: return "⚠️ Нет ключа OpenAI."
+        if not OPENAI_API_KEY: return "⚠️ Нет ключа AI."
         print("🧠 GPT Анализ...")
         try:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
-            # Просим GPT не использовать сложные символы Markdown
             prompt = f"""
             Ты — макроэкономист. Проанализируй отчет ЦБ: "{title}".
-            Дай сигнал для ОФЗ. Используй минимум форматирования (только звездочки для жирного).
+            Дай сигнал для ОФЗ. 
+            НЕ используй markdown символы в тексте, кроме заголовков.
             
             СТРУКТУРА:
             1. *Риторика:* (Жесткая/Мягкая).
@@ -110,58 +121,63 @@ class CBRAgent:
             return f"GPT Error: {e}"
 
     def run(self):
-        print("🔍 Поиск в Календаре ЦБ...")
+        print("🔍 Сканирование ЦБ...")
         url = "https://www.cbr.ru/calendar"
-        
         soup = self.get_soup(url)
         if not soup: return
+
+        # Локальный кеш, чтобы не слать один и тот же файл 10 раз за один запуск
+        session_pdfs = set()
 
         links = soup.find_all('a')
         for link in links:
             title = link.get_text(strip=True)
             href = link.get('href')
-            
             if not href or not title: continue
             
-            # Проверяем название
             is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets)
             
             if is_target:
                 full_url = urljoin("https://www.cbr.ru", href)
-                print(f"🔎 Раздел найден: {title}")
-                
                 sub_soup = self.get_soup(full_url)
+                
                 if sub_soup:
-                    # Собираем ВСЕ PDF со страницы
                     pdf_links = sub_soup.find_all('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
+                    found_pdf = None
                     
-                    found_pdf_url = None
-                    
-                    # ПРИОРИТЕТ 1: Ищем Ноябрь 2025 (11-2025, 2025-11, 11_25)
+                    # 1. Ищем Ноябрь (11)
                     for pl in pdf_links:
-                        ref = pl['href']
-                        if "2025" in ref and ("-11" in ref or "_11" in ref or "11_2025" in ref):
-                            found_pdf_url = urljoin("https://www.cbr.ru", ref)
-                            print("🔥 НАЙДЕН НОЯБРЬСКИЙ ОТЧЕТ!")
+                        if "2025" in pl['href'] and ("-11" in pl['href'] or "_11" in pl['href']):
+                            found_pdf = urljoin("https://www.cbr.ru", pl['href'])
                             break
                     
-                    # ПРИОРИТЕТ 2: Если ноября нет, берем Октябрь (10)
-                    if not found_pdf_url:
+                    # 2. Если нет, берем Октябрь (10)
+                    if not found_pdf:
                         for pl in pdf_links:
-                            ref = pl['href']
-                            if "2025" in ref and ("-10" in ref or "_10" in ref or "10_2025" in ref):
-                                found_pdf_url = urljoin("https://www.cbr.ru", ref)
-                                print("ℹ️ Ноября нет, берем Октябрь.")
+                            if "2025" in pl['href'] and ("-10" in pl['href'] or "_10" in pl['href']):
+                                found_pdf = urljoin("https://www.cbr.ru", pl['href'])
                                 break
                     
-                    if found_pdf_url:
-                        text = self.extract_text_from_pdf(found_pdf_url)
+                    if found_pdf:
+                        # ПРОВЕРКА НА ДУБЛИКАТЫ (САМОЕ ВАЖНОЕ)
+                        if found_pdf in self.processed_urls:
+                            # Мы это уже отправляли в прошлом запуске
+                            continue
+                        
+                        if found_pdf in session_pdfs:
+                            # Мы это уже нашли 5 секунд назад в этом же запуске
+                            continue
+                        
+                        # Добавляем в текущий список, чтобы не обрабатывать снова
+                        session_pdfs.add(found_pdf)
+                        
+                        print(f"🔥 НОВЫЙ ФАЙЛ: {found_pdf}")
+                        text = self.extract_text_from_pdf(found_pdf)
                         if text:
                             ans = self.analyze_with_gpt(text, title)
-                            # Отправляем! (Функция сама разберется с форматом)
-                            self.send_telegram(f"🏦 **ЦБ РФ**\n\n📄 {title}\n\n{ans}\n🔗 {found_pdf_url}")
-                            # Делаем паузу и выходим (чтобы не слать дубли одной новости)
-                            time.sleep(2)
+                            self.send_telegram(f"🏦 **ЦБ РФ**\n\n📄 {title}\n\n{ans}\n🔗 {found_pdf}")
+                            self.save_history(found_pdf) # Сохраняем в вечную память
+                            time.sleep(3)
 
         print("✅ Готово.")
 
