@@ -21,20 +21,23 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class CBRAgent:
     def __init__(self):
         self.history_file = "history.json"
-        self.processed_urls = self.load_history()
+        
+        # 🔥 РЕЖИМ АМНЕЗИИ: Мы специально не загружаем историю, 
+        # чтобы он прочитал существующие отчеты заново.
+        self.processed_urls = set() 
         
         self.session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
         
-        # Притворяемся Яндексом (на всякий случай)
         self.headers = {
             "User-Agent": "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
 
-        # СПИСОК ВАЖНЫХ ОТЧЕТОВ
+        # ДОБАВИЛ "ТРЕНДЫ" В СПИСОК
         self.targets = [
+            r"О чем говорят тренды",        # <--- ДОБАВИЛИ ЭТО
             r"Обзор рисков",
             r"Региональная экономика",
             r"Макроэкономический опрос",
@@ -45,17 +48,11 @@ class CBRAgent:
             r"Динамика потребительских цен"
         ]
 
-    def load_history(self):
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r') as f:
-                    return set(json.load(f))
-            except:
-                return set()
-        return set()
-
     def save_history(self, url):
+        # В этом режиме можно не сохранять, или сохранять - как хочешь.
+        # Пока сохраняем, чтобы при следующем запуске (через час) не спамил.
         self.processed_urls.add(url)
+        # Если файла нет, создаем
         with open(self.history_file, 'w') as f:
             json.dump(list(self.processed_urls), f)
 
@@ -74,25 +71,21 @@ class CBRAgent:
     def get_soup(self, url):
         try:
             resp = self.session.get(url, headers=self.headers, verify=False, timeout=30)
-            resp.raise_for_status()
             return BeautifulSoup(resp.text, 'html.parser')
-        except Exception as e:
-            print(f"⚠️ Ошибка доступа ({url}): {e}")
+        except:
             return None
 
     def extract_text_from_pdf(self, pdf_url):
-        print(f"⬇️ Качаем PDF: {pdf_url}")
+        print(f"⬇️ Качаем: {pdf_url}")
         try:
             resp = self.session.get(pdf_url, headers=self.headers, verify=False, timeout=60)
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
                 text = ""
-                # Первые 7 страниц
                 for i in range(min(7, len(pdf.pages))):
                     t = pdf.pages[i].extract_text()
                     if t: text += t + "\n"
                 return text
-        except Exception as e:
-            print(f"Ошибка PDF: {e}")
+        except:
             return None
 
     def analyze_with_gpt(self, text, title):
@@ -102,15 +95,15 @@ class CBRAgent:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
             prompt = f"""
-            Ты — макроэкономист-трейдер. 
+            Ты — макроэкономист. 
             Проанализируй документ ЦБ РФ: "{title}".
             Дай сигнал для ОФЗ.
             
             СТРУКТУРА:
-            1. 🦅 **Риторика:** (Жесткая/Мягкая/Нейтральная).
+            1. 🦅 **Риторика:** (Жесткая/Мягкая).
             2. 📊 **Факты:** (Инфляция, Ожидания, Кредиты).
-            3. 🏛 **Вывод для ОФЗ:** (Покупать/Продавать/Держать).
-            4. 🔥 **Риск:** (Главная угроза).
+            3. 🏛 **Вывод для ОФЗ:** (Покупать/Продавать).
+            4. 🔥 **Риск:** (Кратко).
 
             Текст: {text[:12000]}
             """
@@ -122,40 +115,28 @@ class CBRAgent:
             return f"GPT Error: {e}"
 
     def run(self):
-        print("🔍 Сканируем Календарь ЦБ...")
-        
-        # ТОЛЬКО ОДНА ССЫЛКА - КАЛЕНДАРЬ
+        print("🔍 Принудительный поиск в Календаре ЦБ...")
         url = "https://www.cbr.ru/calendar"
         
         soup = self.get_soup(url)
-        found_new = False
-
         if soup:
             links = soup.find_all('a')
             for link in links:
                 title = link.get_text(strip=True)
                 href = link.get('href')
-                
                 if not href or not title: continue
                 
-                # 1. ФИЛЬТР 2025 (Чтобы не брать старье)
-                if "2025" not in title and "2025" not in href:
-                    continue
+                # Фильтр: 2025 год
+                if "2025" not in title and "2025" not in href: continue
 
-                # 2. ФИЛЬТР ПО НАЗВАНИЮ
+                # Ищем по расширенному списку
                 is_target = any(re.search(p, title, re.IGNORECASE) for p in self.targets)
                 
                 if is_target:
                     full_url = urljoin("https://www.cbr.ru", href)
+                    print(f"🔥 НАШЕЛ: {title}")
                     
-                    # Проверка истории
-                    if full_url in self.processed_urls:
-                        continue
-                    
-                    print(f"🔥 НАЙДЕН НОВЫЙ: {title}")
-                    found_new = True
-                    
-                    # Ищем PDF
+                    # Логика PDF
                     pdf_url = full_url if href.lower().endswith('.pdf') else None
                     if not pdf_url:
                         sub = self.get_soup(full_url)
@@ -169,13 +150,7 @@ class CBRAgent:
                             ans = self.analyze_with_gpt(text, title)
                             self.send_telegram(f"🏦 **ЦБ РФ**\n\n📄 {title}\n\n{ans}\n🔗 {pdf_url}")
                             self.save_history(full_url)
-                    else:
-                        print("PDF не найден.")
-
-        if not found_new:
-            print("✅ Новых документов в календаре пока нет.")
-        else:
-            print("✅ Уведомления отправлены.")
+        print("✅ Готово.")
 
 if __name__ == "__main__":
     CBRAgent().run()
